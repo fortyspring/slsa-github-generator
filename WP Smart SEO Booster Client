@@ -1,0 +1,153 @@
+<?php
+/*
+Plugin Name: WP Smart SEO Booster Client
+Description: إضافة العميل تتحقق من صلاحية الترخيص عبر API الماستر، وتشغل الوظائف فقط عند التفعيل. تستدعي دوال الماستر دون إعادة تعريف.
+Version: 1.0
+Author: محمد قاسم
+*/
+
+// رابط API الماستر - عدله حسب سيرفرك
+define('MASTER_API_URL', 'https://beiruttime-lb.com/wp-json/masterpro/v1/check/');
+
+// جلب الدومين الحالي بدون www
+function wpsb_client_get_domain() {
+    $domain = strtolower(parse_url(home_url(), PHP_URL_HOST));
+    $domain = preg_replace('/^www\./', '', $domain);
+    return $domain;
+}
+
+// تحقق الترخيص مع تخزين بيانات التفعيل مع كاش 12 ساعة
+function wpsb_client_check_license() {
+    $serial = get_option('wpsb_client_serial', '');
+    if (!$serial) return false;
+
+    $domain = wpsb_client_get_domain();
+
+    $last_check = get_option('wpsb_client_license_last_check', 0);
+    $now = time();
+    if ($last_check > ($now - 12 * 3600)) {
+        return get_option('wpsb_client_activated', false);
+    }
+
+    $response = wp_remote_post(MASTER_API_URL, [
+        'body' => [
+            'serial' => $serial,
+            'domain' => $domain,
+        ],
+        'timeout' => 15,
+    ]);
+
+    if (is_wp_error($response)) {
+        // في حالة فشل الاتصال: نرجع آخر حالة مسجلة
+        return get_option('wpsb_client_activated', false);
+    }
+
+    $data = json_decode(wp_remote_retrieve_body($response), true);
+
+    if (isset($data['status']) && $data['status'] === 'success' && !empty($data['end'])) {
+        update_option('wpsb_client_activated', true);
+        update_option('wpsb_client_expire', $data['end']);
+        update_option('wpsb_client_license_last_check', $now);
+        update_option('wpsb_client_license_type', $data['license_type'] ?? 'months');
+        return true;
+    }
+
+    update_option('wpsb_client_activated', false);
+    update_option('wpsb_client_expire', '');
+    update_option('wpsb_client_license_type', '');
+    return false;
+}
+
+// صفحة تفعيل المنتج في لوحة التحكم
+add_action('admin_menu', function () {
+    add_menu_page('تفعيل WP Smart SEO Booster', 'تفعيل SEO Booster', 'manage_options', 'wpsb_client_license', 'wpsb_client_license_page', 'dashicons-lock', 2);
+});
+
+function wpsb_client_license_page() {
+    if (!current_user_can('manage_options')) return;
+    $msg = '';
+
+    if (isset($_POST['save_serial'])) {
+        $serial = strtoupper(trim(sanitize_text_field($_POST['client_serial'])));
+        update_option('wpsb_client_serial', $serial);
+        delete_option('wpsb_client_activated');
+        delete_option('wpsb_client_expire');
+        delete_option('wpsb_client_license_last_check');
+        delete_option('wpsb_client_license_type');
+
+        if (wpsb_client_check_license()) {
+            $msg = '<div class="notice notice-success">تم تفعيل الإضافة بنجاح! ✅</div>';
+        } else {
+            $msg = '<div class="notice notice-error">فشل التفعيل. تحقق من السيريال أو الدومين أو تواصل مع الدعم.</div>';
+        }
+    }
+
+    $serial = esc_attr(get_option('wpsb_client_serial', ''));
+    $activated = get_option('wpsb_client_activated', false);
+    $expire = get_option('wpsb_client_expire', '');
+    $license_type = get_option('wpsb_client_license_type', '');
+    $domain = wpsb_client_get_domain();
+
+    ?>
+    <div class="wrap">
+        <h1>تفعيل WP Smart SEO Booster</h1>
+        <?php echo $msg; ?>
+        <form method="post">
+            <input type="text" name="client_serial" value="<?php echo $serial; ?>" placeholder="أدخل السيريال المرسل لك" style="width:300px;" required>
+            <input type="submit" name="save_serial" class="button button-primary" value="تفعيل">
+        </form>
+
+        <p>الدومين الحالي: <b><?php echo esc_html($domain); ?></b></p>
+
+        <?php if ($activated && $expire): ?>
+            <p style="color:green;">
+                التفعيل ساري حتى: <?php echo date('Y-m-d', strtotime($expire)); ?><br>
+                نوع الرخصة: 
+                <?php 
+                if ($license_type === 'trial') echo 'تجربة 7 أيام';
+                elseif ($license_type === 'lifetime') echo 'مدى الحياة';
+                else echo 'مدة محددة';
+                ?>
+            </p>
+        <?php elseif ($serial): ?>
+            <p style="color:red;">الإضافة غير مفعلة حالياً. تحقق من السيريال والدومين.</p>
+        <?php endif; ?>
+    </div>
+    <?php
+}
+
+// دالة التحقق من التفعيل (للتحكم في تشغيل الوظائف)
+function wpsb_client_is_activated() {
+    $active = wpsb_client_check_license();
+
+    if ($active) {
+        $license_type = get_option('wpsb_client_license_type', '');
+        $expire = get_option('wpsb_client_expire', '');
+        // تحقق انتهاء فترة التجربة 7 أيام
+        if ($license_type === 'trial') {
+            if (!$expire || strtotime($expire) < time()) {
+                update_option('wpsb_client_activated', false);
+                return false;
+            }
+        }
+    }
+
+    return $active;
+}
+
+// تنبيه في لوحة تحكم ووردبريس إن لم يتم التفعيل
+add_action('admin_notices', function () {
+    if (!wpsb_client_is_activated()) {
+        echo '<div class="notice notice-error"><strong>تنبيه: يجب تفعيل WP Smart SEO Booster بالرخصة الصحيحة عبر صفحة التفعيل.</strong></div>';
+    }
+});
+
+// استدعاء دوال الماستر فقط عند التفعيل
+add_action('save_post', function ($post_id) {
+    if (!wpsb_client_is_activated()) return;
+    if (function_exists('wpsb_smart_seo_process')) {
+        wpsb_smart_seo_process($post_id);
+    }
+}, 99, 1);
+
+?>
